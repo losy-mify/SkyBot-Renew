@@ -1,70 +1,632 @@
-name: SkyBot-Renew
+import os
+import time
+import urllib.request
+import urllib.parse
+import datetime
+from seleniumbase import SB
 
-on:
-  workflow_dispatch:
-  schedule:
-    - cron: '0 1 * * *'
+_account = os.environ["SKYBOT_ACCOUNT"].split(",")
+USERNAME = _account[0].strip()
+PASSWORD = _account[1].strip()
+LOCAL_PROXY = "http://127.0.0.1:8080"
 
-jobs:
-  run_skybot_renew:
-    runs-on: ubuntu-latest
-    steps:
+SERVER_ID = "64b0f742"
+LOGIN_URL = "https://dash.aclclouds.com/auth/login"
+DASHBOARD_URL = "https://dash.aclclouds.com/"
+SERVER_URL = f"https://dash.aclclouds.com/server/{SERVER_ID}"
 
-      - name: 📥 下载私库脚本
-        uses: actions/checkout@v4
-        with:
-          repository: ${{ github.repository_owner }}/SkyBot-Renew-Private
-          token: ${{ secrets.PRIVATE_REPO_TOKEN }}
-          path: private
+_tg = os.environ["TG_BOT"].split(",")
+TG_CHAT_ID = _tg[0].strip()
+TG_TOKEN = _tg[1].strip()
 
-      - name: 📂 移动脚本到工作目录
-        run: mv private/skybot_renew.py skybot_renew.py
 
-      - name: 🐍 设置 Python
-        uses: actions/setup-python@v4
-        with:
-          python-version: '3.10'
+# ============================================================
+# 工具函数
+# ============================================================
 
-      - name: 🛡️ 启动 GOST 代理转发
-        if: ${{ env.GOST_PROXY != '' }}
-        env:
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
-        run: |
-          VERSION=$(curl -s https://api.github.com/repos/ginuerzh/gost/releases/latest | grep '"tag_name"' | cut -d'"' -f4 | tr -d 'v')
-          echo "📦 GOST 版本: $VERSION"
-          wget -q "https://github.com/ginuerzh/gost/releases/download/v${VERSION}/gost_${VERSION}_linux_amd64.tar.gz"
-          tar -xzf "gost_${VERSION}_linux_amd64.tar.gz"
-          chmod +x gost
-          nohup ./gost -L http://:8080 -F "$GOST_PROXY" > gost.log 2>&1 &
-          sleep 3
-          echo "✅ GOST 已启动，测试连通性..."
-          curl -s -x http://127.0.0.1:8080 https://api.ipify.org
+def now_str():
+    return datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
-      - name: 🛠️ 安装系统依赖
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y \
-            google-chrome-stable \
-            xvfb \
-            scrot
 
-      - name: 🐍 安装 Python 依赖
-        run: |
-          pip install seleniumbase
-          seleniumbase install chromedriver
+def send_tg(expiry="", renew_result="", server_status="", error_msg=""):
+    if error_msg:
+        msg = (
+            f"🎮 SkyBot 续期通知\n"
+            f"🕐 运行时间: {now_str()}\n"
+            f"🖥️ 服务器: SkyBots-FR 🇫🇷\n"
+            f"❌ 结果: {error_msg}"
+        )
+    else:
+        msg = (
+            f"🎮 SkyBot 续期通知\n"
+            f"🕐 运行时间: {now_str()}\n"
+            f"🖥️ 服务器: SkyBots-FR 🇫🇷\n"
+            f"📅 利用期限: {expiry}（{renew_result}）\n"
+            f"🔌 服务器状态: {server_status}"
+        )
+    url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
+    data = urllib.parse.urlencode({
+        "chat_id": TG_CHAT_ID,
+        "text": msg,
+    }).encode()
+    try:
+        req = urllib.request.Request(url, data=data, method="POST")
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            print(f"📨 TG推送成功")
+    except Exception as e:
+        print(f"⚠️ TG推送失败：{e}")
 
-      - name: 🚀 运行脚本
-        env:
-          PYTHONIOENCODING: utf-8
-          SKYBOT_ACCOUNT: ${{ secrets.SKYBOT_ACCOUNT }}
-          GOST_PROXY: ${{ secrets.GOST_PROXY }}
-          TG_BOT: ${{ secrets.TG_BOT }}
-        run: |
-          xvfb-run --auto-servernum --server-args="-screen 0 1920x1080x24" python skybot_renew.py
 
-      - name: 📸 上传截图
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: debug-screenshots
-          path: "*.png"
+# ============================================================
+# 页面读取工具
+# ============================================================
+
+def extract_expiry(sb) -> str:
+    """读取剩余时间文本，例如 '1j 21h 6min'"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var divs = document.querySelectorAll('div');
+                for (var i = 0; i < divs.length; i++) {
+                    var text = divs[i].textContent.trim();
+                    if (/^Temps restant\s*:/.test(text)) {
+                        var match = text.match(/Temps restant\s*:\s*([\dj h min]+(?:\d+j)?[\s\S]*?)(?=Offre|$)/);
+                        if (match) return match[1].trim();
+                    }
+                }
+                // 备用：直接找包含 "j" 和 "h" 的时间文本
+                var allDivs = document.querySelectorAll('div[style]');
+                for (var j = 0; j < allDivs.length; j++) {
+                    var t = allDivs[j].textContent.trim();
+                    if (/\d+j\s+\d+h/.test(t)) return t;
+                }
+                return '';
+            })()
+        """) or ''
+    except Exception:
+        return ''
+
+
+def extract_expiry_precise(sb) -> str:
+    """精确读取时间行的文本节点"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var els = document.querySelectorAll('div');
+                for (var i = 0; i < els.length; i++) {
+                    var text = els[i].innerText || els[i].textContent;
+                    var match = text.match(/(\d+j\s+\d+h\s+\d+min)/);
+                    if (match) return match[1].trim();
+                }
+                return '';
+            })()
+        """) or ''
+    except Exception:
+        return ''
+
+
+def parse_remaining_days(expiry_text: str) -> float:
+    """
+    解析剩余时间文本为天数
+    例如 '1j 21h 6min' -> 1.875
+    """
+    import re
+    days = 0
+    hours = 0
+    minutes = 0
+    m = re.search(r'(\d+)j', expiry_text)
+    if m:
+        days = int(m.group(1))
+    m = re.search(r'(\d+)h', expiry_text)
+    if m:
+        hours = int(m.group(1))
+    m = re.search(r'(\d+)min', expiry_text)
+    if m:
+        minutes = int(m.group(1))
+    return days + hours / 24 + minutes / 1440
+
+
+def get_server_status(sb) -> str:
+    """读取服务器在线状态文本，例如 'En ligne' 或 'Hors ligne'"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var spans = document.querySelectorAll('span');
+                for (var i = 0; i < spans.length; i++) {
+                    var t = spans[i].textContent.trim();
+                    if (t === 'En ligne' || t === 'Hors ligne') return t;
+                }
+                return '';
+            })()
+        """) or ''
+    except Exception:
+        return ''
+
+
+def status_with_emoji(status: str) -> str:
+    if status == 'En ligne':
+        return '🟢 En ligne'
+    elif status == 'Hors ligne':
+        return '🔴 Hors ligne'
+    return f'⚪ {status}' if status else '⚪ 未知'
+
+
+# ============================================================
+# 验证码 Token 监控（/auth/captcha XHR）
+# ============================================================
+
+INJECT_CAPTCHA_LISTENER_JS = """
+(function() {
+    if (window.__captcha_listener_injected__) return;
+    window.__captcha_listener_injected__ = true;
+    window.__captcha_token__ = '';
+
+    const originalSend = XMLHttpRequest.prototype.send;
+    XMLHttpRequest.prototype.send = function() {
+        this.addEventListener('load', function() {
+            if (this.responseURL && this.responseURL.includes('/auth/captcha')) {
+                try {
+                    const data = JSON.parse(this.responseText);
+                    if (data.passed && data.token) {
+                        window.__captcha_token__ = data.token;
+                        console.log('[CaptureToken] 已捕获 captcha token');
+                    }
+                } catch(e) {}
+            }
+        });
+        return originalSend.apply(this, arguments);
+    };
+    console.log('[CaptureToken] XHR监听器已注入');
+})();
+"""
+
+READ_CAPTCHA_TOKEN_JS = """
+(function(){ return window.__captcha_token__ || ''; })()
+"""
+
+
+def inject_captcha_listener(sb):
+    try:
+        sb.execute_script(INJECT_CAPTCHA_LISTENER_JS)
+        print("📡 验证码Token监听器已注入")
+    except Exception as e:
+        print(f"⚠️ 监听器注入失败：{e}")
+
+
+def get_captcha_token(sb) -> str:
+    try:
+        token = sb.execute_script(READ_CAPTCHA_TOKEN_JS)
+        return token if token else ''
+    except Exception:
+        return ''
+
+
+def captcha_exists(sb) -> bool:
+    """检测验证码组件是否存在"""
+    try:
+        return sb.execute_script("""
+            (function(){
+                var el = document.querySelector('.auth-captcha-box, .auth-captcha-inner');
+                return el !== null;
+            })()
+        """) or False
+    except Exception:
+        return False
+
+
+def simulate_human_mouse(sb):
+    """
+    在填写表单后、点击验证码前，模拟人类鼠标随机游走。
+    目标：让前端追踪器积累足够的 mouse_movements 和 mouse_distance。
+    """
+    import random
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    print("🖱️ 模拟人类鼠标移动中...")
+    try:
+        size = sb.execute_script(
+            "return {w: document.body.scrollWidth, h: document.body.scrollHeight};"
+        )
+        page_w = min(size.get('w', 800), 1200)
+        page_h = min(size.get('h', 600), 900)
+
+        actions = ActionChains(sb.driver)
+
+        cur_x = random.randint(300, 600)
+        cur_y = random.randint(200, 400)
+        actions.move_by_offset(cur_x, cur_y)
+        actions.pause(random.uniform(0.1, 0.3))
+
+        steps = random.randint(15, 20)
+        for i in range(steps):
+            dx = random.randint(-120, 120)
+            dy = random.randint(-80, 80)
+            next_x = max(50, min(page_w - 50, cur_x + dx))
+            next_y = max(50, min(page_h - 50, cur_y + dy))
+            real_dx = next_x - cur_x
+            real_dy = next_y - cur_y
+            cur_x, cur_y = next_x, next_y
+            actions.move_by_offset(real_dx, real_dy)
+            actions.pause(random.uniform(0.05, 0.2))
+
+        actions.perform()
+        print(f"✅ 鼠标游走完成（{steps}步）")
+        time.sleep(random.uniform(0.5, 1.0))
+
+    except Exception as e:
+        print(f"⚠️ 鼠标模拟失败（不影响流程）：{e}")
+
+
+def click_captcha_checkbox(sb):
+    """
+    模拟鼠标移动到元素后点击验证码复选框。
+    """
+    import random
+    from selenium.webdriver.common.action_chains import ActionChains
+
+    try:
+        sb.execute_script("""
+            var el = document.querySelector('.auth-captcha-inner');
+            if (el) el.scrollIntoView({behavior: 'smooth', block: 'center'});
+        """)
+        time.sleep(0.8)
+    except Exception:
+        pass
+
+    # 方式一：ActionChains
+    try:
+        el = sb.find_element('.auth-captcha-inner')
+        actions = ActionChains(sb.driver)
+        actions.move_to_element_with_offset(el, random.randint(8, 15), random.randint(-2, 2))
+        actions.pause(random.uniform(0.2, 0.4))
+        actions.move_to_element(el)
+        actions.pause(random.uniform(0.1, 0.25))
+        actions.click()
+        actions.perform()
+        print("✅ 已点击验证码复选框（ActionChains）")
+        return True
+    except Exception as e:
+        print(f"⚠️ ActionChains点击失败：{e}，尝试备用方式...")
+
+    # 方式二：uc_click
+    try:
+        sb.uc_click('.auth-captcha-inner')
+        print("✅ 已点击验证码复选框（uc_click）")
+        return True
+    except Exception as e:
+        print(f"⚠️ uc_click失败：{e}，尝试备用方式...")
+
+    # 方式三：sb.click
+    try:
+        sb.click('.auth-captcha-inner')
+        print("✅ 已点击验证码复选框（sb.click）")
+        return True
+    except Exception as e:
+        print(f"⚠️ sb.click失败：{e}")
+        return False
+
+
+def solve_captcha(sb) -> str:
+    """
+    处理自定义验证码，返回获取到的 token。
+    流程：注入监听 → 模拟鼠标游走 → 点击复选框 → 轮询等待 token，失败则最多重试3次
+    """
+    inject_captcha_listener(sb)
+
+    token = get_captcha_token(sb)
+    if token:
+        print(f"✅ 验证码Token已就绪：{token[:30]}...")
+        return token
+
+    if not captcha_exists(sb):
+        print("➡️ 未检测到验证码组件，跳过")
+        return ''
+
+    print("⏳ 等待验证码组件就绪...")
+    for _ in range(10):
+        if captcha_exists(sb):
+            break
+        time.sleep(0.5)
+
+    # 点击前先模拟鼠标游走，积累行为数据
+    simulate_human_mouse(sb)
+
+    # 最多重试 3 次
+    for attempt in range(1, 4):
+        print(f"🖱️ 点击验证码复选框（第{attempt}次尝试）...")
+        if not click_captcha_checkbox(sb):
+            break
+
+        print("⏳ 等待验证码Token...")
+        for _ in range(30):
+            time.sleep(0.5)
+            token = get_captcha_token(sb)
+            if token:
+                print(f"✅ 验证码Token获取成功：{token[:30]}...")
+                return token
+
+        failed = sb.execute_script("""
+            (function(){
+                var el = document.querySelector('.auth-captcha-box');
+                return el ? el.textContent.includes('échouée') || el.textContent.includes('failed') : false;
+            })()
+        """)
+        if failed:
+            print(f"⚠️ 第{attempt}次验证失败，补充鼠标移动后重试...")
+            inject_captcha_listener(sb)
+            simulate_human_mouse(sb)
+            time.sleep(1)
+        else:
+            print(f"⚠️ 第{attempt}次未获取到Token，等待后重试...")
+            time.sleep(2)
+
+    print("❌ 验证码Token获取超时")
+    sb.save_screenshot("captcha_timeout.png")
+    return ''
+
+def run_script():
+    print("🔧 启动浏览器...")
+
+    with SB(uc=True, test=True, proxy=LOCAL_PROXY) as sb:
+        print("🚀 浏览器就绪！")
+
+        # ── IP 验证 ──────────────────────────────────────────
+        print("🌐 验证出口IP...")
+        try:
+            sb.open("https://api.ipify.org/?format=json")
+            import re as _re
+            ip_text = sb.get_text('body')
+            ip_text = _re.sub(r'(\d+\.\d+\.\d+\.)\d+', r'\1xx', ip_text)
+            print(f"✅ 出口IP确认：{ip_text}")
+        except Exception:
+            print("⚠️ IP验证超时，跳过")
+
+        # ── 打开登录页 ────────────────────────────────────────
+        print("🔑 打开登录页面...")
+        sb.uc_open_with_reconnect(LOGIN_URL, reconnect_time=4)
+        time.sleep(3)
+
+        # 注入监听器（尽早注入，防止错过XHR请求）
+        inject_captcha_listener(sb)
+
+        # ── 填写账号密码 ──────────────────────────────────────
+        print("✏️ 填写账号密码...")
+        try:
+            sb.wait_for_element_visible('#username', timeout=20)
+            sb.type('#username', USERNAME)
+            sb.type('#password', PASSWORD)
+        except Exception:
+            print("❌ 登录框加载失败")
+            sb.save_screenshot("login_fail.png")
+            send_tg(error_msg="登录框加载失败")
+            return
+
+        # ── 处理验证码 ────────────────────────────────────────
+        print("⏳ 检查验证码组件...")
+        time.sleep(1)
+        token = solve_captcha(sb)
+        if not token and captcha_exists(sb):
+            print("❌ 验证码处理失败")
+            sb.save_screenshot("captcha_fail.png")
+            send_tg(error_msg="验证码处理失败")
+            return
+
+        # ── 提交登录 ──────────────────────────────────────────
+        print("📤 提交登录请求...")
+        try:
+            sb.click('button[type="submit"].auth-submit-btn')
+        except Exception:
+            try:
+                sb.click('button[type="submit"]')
+            except Exception:
+                print("❌ 登录按钮不可用")
+                sb.save_screenshot("login_submit_fail.png")
+                send_tg(error_msg="登录按钮不可用")
+                return
+
+        # ── 等待登录完成 ──────────────────────────────────────
+        print("⏳ 等待登录跳转...")
+        for _ in range(80):
+            try:
+                url = sb.get_current_url()
+                if "dash.aclclouds.com" in url and "auth" not in url:
+                    print(f"✅ 登录成功！当前页面：{url}")
+                    break
+            except Exception:
+                pass
+            time.sleep(0.5)
+        else:
+            print("❌ 登录等待超时")
+            sb.save_screenshot("login_timeout.png")
+            send_tg(error_msg="登录等待超时")
+            return
+
+        time.sleep(2)
+
+        # ── 跳转服务器页面 ────────────────────────────────────
+        print(f"🔍 跳转服务器页面：{SERVER_URL}")
+        sb.execute_script(f"window.location.href = '{SERVER_URL}';")
+        time.sleep(4)
+
+        if "auth/login" in sb.get_current_url():
+            print("❌ 被踢回登录页")
+            sb.save_screenshot("server_page_fail.png")
+            send_tg(error_msg="跳转服务器页面后被踢回登录页")
+            return
+
+        sb.save_screenshot("server_page.png")
+        print("📸 服务器页面截图已保存")
+
+        # ── 读取利用期限 ──────────────────────────────────────
+        print("📅 读取利用期限...")
+        expiry = extract_expiry_precise(sb)
+        if not expiry:
+            expiry = extract_expiry(sb)
+
+        if not expiry:
+            print("⚠️ 无法读取利用期限")
+            sb.save_screenshot("no_expiry.png")
+            send_tg(error_msg="无法读取利用期限")
+            return
+
+        print(f"📅 当前利用期限：{expiry}")
+        remaining_days = parse_remaining_days(expiry)
+        print(f"📊 剩余天数换算：{remaining_days:.2f} 天")
+
+        renew_result = "无需续期"
+
+        # ── 判断是否需要续期 ──────────────────────────────────
+        if remaining_days < 2:
+            print(f"⏰ 剩余不足2天（{remaining_days:.2f}天），开始续期...")
+
+            # 查找 Renouveler 按钮
+            renew_btn_found = False
+            for sel in [
+                'button[style*="background: rgb(10, 132, 255)"]',
+                '//button[contains(text(),"Renouveler")]',
+                '//button[.//text()[contains(.,"Renouveler")]]',
+            ]:
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        renew_btn_found = True
+                        print("✅ 已点击「Renouveler」续期按钮")
+                        break
+                except Exception:
+                    continue
+
+            if not renew_btn_found:
+                # JS 备用点击
+                clicked = sb.execute_script("""
+                    (function(){
+                        var btns = document.querySelectorAll('button');
+                        for (var i = 0; i < btns.length; i++) {
+                            if (btns[i].textContent.trim().indexOf('Renouveler') !== -1) {
+                                btns[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+                if clicked:
+                    renew_btn_found = True
+                    print("✅ 已点击「Renouveler」续期按钮（JS方式）")
+                else:
+                    print("❌ 未找到续期按钮")
+                    sb.save_screenshot("no_renew_btn.png")
+                    send_tg(error_msg="未找到续期按钮")
+                    return
+
+            # 等待页面刷新/响应
+            print("⏳ 等待续期响应...")
+            time.sleep(5)
+            sb.save_screenshot("after_renew.png")
+
+            # 重新读取利用期限
+            print("📅 重新读取利用期限...")
+            expiry_new = extract_expiry_precise(sb)
+            if not expiry_new:
+                expiry_new = extract_expiry(sb)
+
+            if expiry_new:
+                expiry = expiry_new
+                print(f"📅 续期后利用期限：{expiry}")
+            else:
+                print("⚠️ 续期后无法读取期限，使用续期前数据")
+
+            renew_result = "续期成功"
+        else:
+            print(f"✅ 剩余 {remaining_days:.2f} 天，无需续期")
+
+        # ── 读取服务器状态 ────────────────────────────────────
+        print("🔍 读取服务器状态...")
+        status = get_server_status(sb)
+        print(f"🔌 服务器状态：{status or '未知'}")
+
+        # ── 如果离线则启动 ────────────────────────────────────
+        if status == 'Hors ligne':
+            print("🔴 服务器离线，尝试启动...")
+
+            started = False
+            for sel in [
+                'button.power-btn[data-variant="start"]',
+                '//button[@data-variant="start"]',
+            ]:
+                try:
+                    if sb.is_element_visible(sel):
+                        sb.click(sel)
+                        started = True
+                        print("✅ 已点击「Start」按钮")
+                        break
+                except Exception:
+                    continue
+
+            if not started:
+                clicked = sb.execute_script("""
+                    (function(){
+                        var btns = document.querySelectorAll('button.power-btn');
+                        for (var i = 0; i < btns.length; i++) {
+                            if (btns[i].getAttribute('data-variant') === 'start') {
+                                btns[i].click();
+                                return true;
+                            }
+                        }
+                        return false;
+                    })()
+                """)
+                if clicked:
+                    started = True
+                    print("✅ 已点击「Start」按钮（JS方式）")
+
+            if not started:
+                print("❌ 未找到Start按钮")
+                sb.save_screenshot("no_start_btn.png")
+                send_tg(
+                    expiry=expiry,
+                    renew_result=renew_result,
+                    error_msg="服务器离线，未找到Start按钮"
+                )
+                return
+
+            # ── 轮询等待服务器上线 ────────────────────────────
+            print("⏳ 等待服务器上线...")
+            online = False
+            for attempt in range(60):  # 最长等待 5 分钟
+                time.sleep(5)
+                try:
+                    sb.refresh()
+                    time.sleep(3)
+                except Exception:
+                    pass
+                status = get_server_status(sb)
+                print(f"   [{attempt+1}/60] 状态：{status or '读取中...'}")
+                if status == 'En ligne':
+                    online = True
+                    print("✅ 服务器已上线！")
+                    break
+
+            if not online:
+                print("❌ 服务器启动超时")
+                sb.save_screenshot("start_timeout.png")
+                send_tg(
+                    expiry=expiry,
+                    renew_result=renew_result,
+                    error_msg="服务器启动超时，请手动检查"
+                )
+                return
+
+        # ── 最终推送 ──────────────────────────────────────────
+        sb.save_screenshot("final_state.png")
+        final_status = status_with_emoji(status)
+        print(f"📨 推送结果：期限={expiry}，操作={renew_result}，状态={final_status}")
+        send_tg(
+            expiry=expiry,
+            renew_result=renew_result,
+            server_status=final_status,
+        )
+        print("🎉 任务完成！")
+
+
+if __name__ == "__main__":
+    run_script()
