@@ -1,7 +1,5 @@
 name: SkyBot-Renew
 on:
-  schedule:
-    - cron: '0 1 * * *'  # 北京时间每天 09:00 (UTC+8 → UTC 01:00)
   workflow_dispatch:
 
 jobs:
